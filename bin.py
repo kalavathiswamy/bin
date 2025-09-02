@@ -2,8 +2,6 @@
 import psutil
 import requests
 import random
-import threading
-import time
 import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -13,7 +11,6 @@ BOT_TOKEN = '8329472164:AAHg69_QmSwfelkoYhoaNbdRtmv7vMfxTuQ'
 CHAT_ID = 1822845513
 CHECK_INTERVAL = 1
 STATS_INTERVAL = 10
-TELEGRAM_DELAY = 1.5
 
 running = False
 total_attempts = 0
@@ -25,52 +22,35 @@ stats_message_id = None
 def get_system_status():
     cpu = psutil.cpu_percent(interval=1)
     mem = psutil.virtual_memory()
-    mem_percent = mem.percent
     disk = psutil.disk_usage('/')
-    disk_percent = disk.percent
     storage = f"Total: {disk.total // (2**30)} GB, Used: {disk.used // (2**30)} GB, Free: {disk.free // (2**30)} GB"
-    return f"CPU: {cpu}%\nMemory: {mem_percent}%\nDisk: {disk_percent}%\nStorage: {storage}"
+    return f"CPU: {cpu}%\nMemory: {mem.percent}%\nDisk: {disk.percent}%\nStorage: {storage}"
 
 async def send_to_telegram(context, message: str, edit_id=None):
     global stats_message_id
     try:
         if edit_id and stats_message_id:
-            await context.bot.edit_message_text(chat_id=CHAT_ID, message_id=edit_id,
-                                                text=message, parse_mode='HTML', disable_web_page_preview=True)
+            await context.bot.edit_message_text(
+                chat_id=CHAT_ID,
+                message_id=edit_id,
+                text=message,
+                parse_mode='HTML',
+                disable_web_page_preview=True
+            )
         else:
-            msg = await context.bot.send_message(chat_id=CHAT_ID, text=message,
-                                                 parse_mode='HTML', disable_web_page_preview=True)
-            await asyncio.sleep(TELEGRAM_DELAY)
+            msg = await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text=message,
+                parse_mode='HTML',
+                disable_web_page_preview=True
+            )
             return msg.message_id
     except Exception as e:
-        print(f"⚠️ Telegram send/edit error: {e}")
+        print(f"⚠️ Telegram error: {e}")
         return None
 
-def check_bin(bin_number: str):
-    global valid_bins, invalid_bins
-    try:
-        url = f"https://data.handyapi.com/bin/{bin_number}"
-        response = requests.get(url, timeout=8)  # No API key needed
-
-        if response.status_code != 200:
-            invalid_bins += 1
-            return False
-
-        data = response.json()
-        if data.get("Status", "").upper() == "SUCCESS":
-            valid_bins += 1
-            return data
-        else:
-            invalid_bins += 1
-            return None
-    except Exception as e:
-        invalid_bins += 1
-        print(f"⚠️ Error checking BIN {bin_number}: {e}")
-        return None
-
-# ---------------- SMART BIN GENERATOR ----------------
 def generate_smart_bin():
-    prefixes = ['40', '41', '42', '51', '52', '53', '54', '34', '37']  # common BIN prefixes
+    prefixes = ['40', '41', '42', '51', '52', '53', '54', '34', '37']
     prefix = random.choice(prefixes)
     while True:
         remaining = ''.join([str(random.randint(0, 9)) for _ in range(6 - len(prefix))])
@@ -89,8 +69,27 @@ def luhn_check(bin_number):
         sum_ += n
     return sum_ % 10 == 0
 
-# ---------------- WORKERS ----------------
-def bin_worker(context):
+def check_bin(bin_number):
+    global valid_bins, invalid_bins
+    try:
+        url = f"https://data.handyapi.com/bin/{bin_number}"
+        response = requests.get(url, timeout=8)
+        if response.status_code != 200:
+            invalid_bins += 1
+            return None
+        data = response.json()
+        if data.get("Status", "").upper() == "SUCCESS":
+            valid_bins += 1
+            return data
+        else:
+            invalid_bins += 1
+            return None
+    except:
+        invalid_bins += 1
+        return None
+
+# ---------------- ASYNC WORKERS ----------------
+async def bin_worker(context):
     global running, total_attempts
     while running:
         bin_number = generate_smart_bin()
@@ -108,10 +107,10 @@ def bin_worker(context):
                 "─────────────────────────\n"
                 "<i>Generated & Verified by BIN Checker Bot</i>"
             )
-            asyncio.run_coroutine_threadsafe(send_to_telegram(context, message), context.application.bot.loop)
-        time.sleep(CHECK_INTERVAL)
+            await send_to_telegram(context, message)
+        await asyncio.sleep(CHECK_INTERVAL)
 
-def stats_worker(context):
+async def stats_worker(context):
     global running, total_attempts, valid_bins, invalid_bins, stats_message_id
     if stats_message_id is None:
         message = (
@@ -123,7 +122,7 @@ def stats_worker(context):
             "─────────────────────────\n"
             "<i>Professional BIN Checker Bot</i>"
         )
-        stats_message_id = asyncio.run_coroutine_threadsafe(send_to_telegram(context, message), context.application.bot.loop).result()
+        stats_message_id = await send_to_telegram(context, message)
     while running:
         message = (
             f"📊 <b>Live BIN Checking Stats</b>\n\n"
@@ -134,8 +133,8 @@ def stats_worker(context):
             "─────────────────────────\n"
             "<i>Professional BIN Checker Bot</i>"
         )
-        asyncio.run_coroutine_threadsafe(send_to_telegram(context, message, edit_id=stats_message_id), context.application.bot.loop)
-        time.sleep(STATS_INTERVAL)
+        await send_to_telegram(context, message, edit_id=stats_message_id)
+        await asyncio.sleep(STATS_INTERVAL)
 
 # ---------------- TELEGRAM COMMANDS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,8 +174,8 @@ async def start_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not running:
         running = True
         await send_to_telegram(context, "▶️ <b>Random BIN checking started!</b>")
-        threading.Thread(target=bin_worker, args=(context,), daemon=True).start()
-        threading.Thread(target=stats_worker, args=(context,), daemon=True).start()
+        asyncio.create_task(bin_worker(context))
+        asyncio.create_task(stats_worker(context))
     else:
         await update.message.reply_text("⚠️ Random BIN checking is already running.")
 
