@@ -6,8 +6,8 @@ import threading
 import time
 
 # -------------------- CONFIG --------------------
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+BOT_TOKEN = "8329472164:AAHg69_QmSwfelkoYhoaNbdRtmv7vMfxTuQ"
+CHAT_ID = "1822845513"
 API_URL = "https://lookup.binlist.net/{}"
 CHECK_INTERVAL = 1  # seconds between random BIN generation
 TELEGRAM_DELAY = 1.5  # seconds between sending messages to avoid Telegram limits
@@ -130,4 +130,5 @@ def show_stats(message):
 
 # -------------------- MAIN --------------------
 print("🤖 Bot is running... Waiting for /bin, /stop, /chk, or /stats commands.")
+
 bot.infinity_polling()
