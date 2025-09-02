@@ -1,8 +1,21 @@
-import logging
-import requests
-import psutil
-import asyncio
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Admin-controlled Telegram bot with:
+- Numeric /add <userId> and /remove <userId>, persisted in users.txt
+- Authorization guard for all commands
+- /start: shows basic server info
+- /run [minutes]: starts a harmless long-running job with batching output
+- /stop: stops the job
+NOTE: This template is compliance-friendly and does NOT implement BIN/VBV features.
+"""
+
 import os
+import asyncio
+import psutil
+from datetime import datetime, timedelta
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -10,174 +23,259 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# =========================
-# CONFIG
-# =========================
-BOT_TOKEN = "8329472164:AAHg69_QmSwfelkoYhoaNbdRtmv7vMfxTuQ"
-ADMIN_ID = 1822845513  # your Telegram user ID (owner)
-USERS_FILE = "users.txt"
+# ========= CONFIGURE THESE =========
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+OWNER_ID = 1822845513                   # your Telegram numeric user ID (admin)
+USERS_FILE = "users.txt"                # persisted approved users (one ID per line)
 
-# =========================
-# LOGGING
-# =========================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+BATCH_SIZE = 10                         # how many items per message batch
+TICK_SECONDS = 1                        # how often the worker produces an item
+# ===================================
 
-# =========================
-# LOAD & SAVE USERS
-# =========================
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "w") as f:
-            f.write(str(ADMIN_ID) + "\n")  # admin is always approved
-        return {ADMIN_ID}
+# Global runtime state
+approved_users: set[str] = set()
+worker_task: asyncio.Task | None = None
+worker_should_run: bool = False
 
-    with open(USERS_FILE, "r") as f:
-        return {int(line.strip()) for line in f if line.strip().isdigit()}
 
-def save_user(user_id: int):
-    with open(USERS_FILE, "a") as f:
-        f.write(str(user_id) + "\n")
+# ---------- Helpers: user storage & auth ----------
 
-approved_users = load_users()
+def load_users() -> set[str]:
+    """Load approved user IDs (as strings) from USERS_FILE.
+    Ensures OWNER_ID is always present."""
+    users = set()
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.isdigit():
+                    users.add(line)
+    # Ensure owner is always authorized
+    users.add(str(OWNER_ID))
+    # Save back to guarantee presence on disk
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        for uid in sorted(users, key=int):
+            f.write(uid + "\n")
+    return users
 
-def is_approved(user_id: int) -> bool:
-    return user_id in approved_users
 
-# =========================
-# UTILS
-# =========================
-def get_server_status():
-    cpu = psutil.cpu_percent()
-    memory = psutil.virtual_memory().percent
+def save_users(users: set[str]) -> None:
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        for uid in sorted(users, key=int):
+            f.write(uid + "\n")
+
+
+def is_authorized(user_id: int) -> bool:
+    return str(user_id) in approved_users
+
+
+# ---------- Helpers: system info ----------
+
+def server_status_text() -> str:
+    cpu = psutil.cpu_percent(interval=0.5)
+    mem = psutil.virtual_memory().percent
     disk = psutil.disk_usage("/").percent
-    return f"""
-🤖 Bot Status:
-━━━━━━━━━━━━━━━━
-🖥 CPU: {cpu}%
-📦 RAM: {memory}%
-💽 Disk: {disk}%
-✅ Running smoothly!
-"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f"🤖 Bot Status (as of {now})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🖥 CPU: {cpu:.0f}%\n"
+        f"📦 RAM: {mem:.0f}%\n"
+        f"💽 Disk: {disk:.0f}%\n"
+        f"✅ Ready.\n"
+    )
 
-def fetch_bin_info(bin_number: str):
-    try:
-        url = f"https://data.handyapi.com/bin/{bin_number}"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            scheme = data.get("Scheme", "N/A")
-            card_type = data.get("Type", "N/A")
-            brand = data.get("CardTier", "N/A")
-            issuer = data.get("Issuer", "N/A")
-            country = data.get("Country", {}).get("Name", "N/A")
 
-            return f"""
-🏦 VALID BIN FOUND!
+# ---------- Worker (harmless placeholder) ----------
 
-💳 BIN: {bin_number}
-💳 Scheme: {scheme}
-📝 Type: {card_type}
-🏷 Brand: {brand}
-🏭 Issuer: {issuer}
-🌐 Country: {country}
-─────────────────────────
-Generated & Verified by BIN Checker Bot
-"""
-        else:
-            return f"❌ Failed to fetch BIN {bin_number} (Status {response.status_code})"
-    except Exception as e:
-        return f"⚠️ Error fetching BIN {bin_number}: {e}"
+async def run_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE, minutes: int | None):
+    """
+    Harmless long-running job that simulates producing items and batching them into messages.
+    - Produces one "item" every TICK_SECONDS.
+    - Sends a batched message every BATCH_SIZE items.
+    - If `minutes` is provided, auto-stops after that time.
+    Replace the item generation block with your legitimate business logic.
+    """
+    global worker_should_run
+    worker_should_run = True
 
-# =========================
-# COMMANDS
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_approved(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this bot.")
-        return
+    end_time = datetime.now() + timedelta(minutes=minutes) if minutes else None
+    batch: list[str] = []
+    sent_total = 0
 
-    status = get_server_status()
-    await update.message.reply_text(f"👋 Hello {update.effective_user.first_name}!\n{status}")
-
-async def bin_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_approved(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this bot.")
-        return
-
-    if len(context.args) == 0:
-        await update.message.reply_text("⚠️ Usage: /bin <bin_number>")
-        return
-
-    bin_number = context.args[0]
-    result = fetch_bin_info(bin_number)
-    await update.message.reply_text(result)
-
-async def batch_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_approved(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this bot.")
-        return
-
-    if len(context.args) == 0:
-        await update.message.reply_text("⚠️ Usage: /batch <bin1> <bin2> ... <bin10>")
-        return
-
-    bins = context.args[:10]
-    results = []
-    for b in bins:
-        results.append(fetch_bin_info(b))
-        await asyncio.sleep(1)  # avoid spamming API
-
-    await update.message.reply_text("\n".join(results))
-
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ Only the admin can approve new users.")
-        return
-
-    if len(context.args) == 0:
-        await update.message.reply_text("⚠️ Usage: /add <user_id>")
-        return
+    # Initial notice
+    if minutes:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"▶️ Started job. It will auto-stop in {minutes} minute(s)."
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="▶️ Started job. It will run until you send /stop."
+        )
 
     try:
-        new_user = int(context.args[0])
-        if new_user in approved_users:
-            await update.message.reply_text(f"⚠️ User {new_user} is already approved.")
-            return
-        approved_users.add(new_user)
-        save_user(new_user)
-        await update.message.reply_text(f"✅ User {new_user} has been approved and saved.")
-    except ValueError:
-        await update.message.reply_text("⚠️ Invalid user ID.")
+        while worker_should_run:
+            # Auto-stop by timer
+            if end_time and datetime.now() >= end_time:
+                break
 
-async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_approved(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this bot.")
-        return
+            # ---- Replace this block with your legitimate work ----
+            # Simulate producing a harmless "item"
+            item_number = sent_total + 1
+            item_text = (
+                "📦 Item ready!\n\n"
+                f"• ID: {item_number}\n"
+                f"• Note: Placeholder result\n"
+                "─────────────────────────\n"
+                "Generated by Admin Bot"
+            )
+            # ------------------------------------------------------
 
-    await update.message.reply_text("🛑 Bot stopped. Use /start to run again.")
+            batch.append(item_text)
+            sent_total += 1
 
-# =========================
-# MAIN
-# =========================
+            # Send a batch every BATCH_SIZE items
+            if len(batch) >= BATCH_SIZE:
+                await context.bot.send_message(chat_id=chat_id, text="\n\n".join(batch))
+                batch.clear()
+
+            await asyncio.sleep(TICK_SECONDS)
+
+        # Flush any remaining items
+        if batch:
+            await context.bot.send_message(chat_id=chat_id, text="\n\n".join(batch))
+
+    finally:
+        worker_should_run = False
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏹️ Job stopped. Total items: {sent_total}"
+        )
+
+
+# ---------- Commands ----------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_authorized(user.id):
+        return await update.message.reply_text("🚫 You are not authorized to use this bot.")
+    await update.message.reply_text(
+        "👋 Hello! Admin Bot is online.\n\n" + server_status_text() +
+        "\nCommands:\n"
+        "• /add <userId> — approve a user (admin only)\n"
+        "• /remove <userId> — remove a user (admin only)\n"
+        "• /run [minutes] — start a job (approved users)\n"
+        "• /stop — stop the running job"
+    )
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        return await update.message.reply_text("🚫 Only the owner can add users.")
+
+    if not context.args:
+        return await update.message.reply_text("⚠️ Usage: /add <numeric_user_id>")
+
+    uid = context.args[0].strip()
+    if not uid.isdigit():
+        return await update.message.reply_text("⚠️ User ID must be numeric.")
+
+    if uid in approved_users:
+        return await update.message.reply_text(f"ℹ️ {uid} is already approved.")
+
+    approved_users.add(uid)
+    save_users(approved_users)
+    await update.message.reply_text(f"✅ User {uid} approved and saved to users.txt.")
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        return await update.message.reply_text("🚫 Only the owner can remove users.")
+
+    if not context.args:
+        return await update.message.reply_text("⚠️ Usage: /remove <numeric_user_id>")
+
+    uid = context.args[0].strip()
+    if not uid.isdigit():
+        return await update.message.reply_text("⚠️ User ID must be numeric.")
+
+    if uid == str(OWNER_ID):
+        return await update.message.reply_text("⚠️ You cannot remove the owner.")
+
+    if uid in approved_users:
+        approved_users.remove(uid)
+        save_users(approved_users)
+        return await update.message.reply_text(f"🗑️ User {uid} removed.")
+    else:
+        return await update.message.reply_text(f"❌ User {uid} not found.")
+
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the harmless worker. Usage: /run [minutes]"""
+    global worker_task, worker_should_run
+
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if not is_authorized(user.id):
+        return await update.message.reply_text("🚫 You are not authorized to use this bot.")
+
+    if worker_task and not worker_task.done() and worker_should_run:
+        return await update.message.reply_text("⚠️ A job is already running. Use /stop first.")
+
+    # Parse optional minutes
+    minutes = None
+    if context.args:
+        arg = context.args[0].strip()
+        if not arg.isdigit() or int(arg) <= 0:
+            return await update.message.reply_text("⚠️ Minutes must be a positive integer. Example: /run 10")
+        minutes = int(arg)
+
+    # Start the worker
+    worker_task = asyncio.create_task(run_worker(chat_id, context, minutes))
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop the worker if running."""
+    global worker_task, worker_should_run
+
+    user = update.effective_user
+    if not is_authorized(user.id):
+        return await update.message.reply_text("🚫 You are not authorized to use this bot.")
+
+    if worker_task and not worker_task.done() and worker_should_run:
+        worker_should_run = False
+        await update.message.reply_text("🛑 Stopping the job…")
+        # Let the worker finalize gracefully
+        try:
+            await asyncio.wait_for(worker_task, timeout=10)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        worker_task = None
+    else:
+        await update.message.reply_text("ℹ️ No job is currently running.")
+
+
+# ---------- Main ----------
+
 def main():
+    global approved_users
+    approved_users = load_users()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("bin", bin_lookup))
-    app.add_handler(CommandHandler("batch", batch_lookup))
-    app.add_handler(CommandHandler("stop", stop_bot))
-    app.add_handler(CommandHandler("add", add_user))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("stop", cmd_stop))
 
-    logger.info("🤖 Bot is running...")
-    app.run_polling()
+    print("🤖 Admin Bot is running…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
