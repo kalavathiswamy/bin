@@ -1,249 +1,183 @@
-# -*- coding: utf-8 -*-
-import psutil
+import logging
 import requests
-import random
+import psutil
 import asyncio
+import os
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = '8329472164:AAHg69_QmSwfelkoYhoaNbdRtmv7vMfxTuQ'
-CHAT_ID = 1822845513
-CHECK_INTERVAL = 1  # seconds
-STATS_INTERVAL = 10  # seconds
-BATCH_SIZE = 10
+# =========================
+# CONFIG
+# =========================
+BOT_TOKEN = "8329472164:AAHg69_QmSwfelkoYhoaNbdRtmv7vMfxTuQ"
+ADMIN_ID = 1822845513  # your Telegram user ID (owner)
+USERS_FILE = "users.txt"
 
-# ---------------- GLOBALS ----------------
-running = False
-total_attempts = 0
-valid_bins = 0
-invalid_bins = 0
-stats_message_id = None
-valid_batch = []
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# ---------------- FUNCTIONS ----------------
-def get_system_status():
-    cpu = psutil.cpu_percent(interval=1)
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-    storage = f"Total: {disk.total // (2**30)} GB, Used: {disk.used // (2**30)} GB, Free: {disk.free // (2**30)} GB"
-    return f"CPU: {cpu}%\nMemory: {mem.percent}%\nDisk: {disk.percent}%\nStorage: {storage}"
+# =========================
+# LOAD & SAVE USERS
+# =========================
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "w") as f:
+            f.write(str(ADMIN_ID) + "\n")  # admin is always approved
+        return {ADMIN_ID}
 
-async def send_to_telegram(context, message: str, edit_id=None):
-    global stats_message_id
-    try:
-        if edit_id and stats_message_id:
-            await context.bot.edit_message_text(
-                chat_id=CHAT_ID,
-                message_id=edit_id,
-                text=message,
-                parse_mode='HTML',
-                disable_web_page_preview=True
-            )
-        else:
-            msg = await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=message,
-                parse_mode='HTML',
-                disable_web_page_preview=True
-            )
-            return msg.message_id
-    except Exception as e:
-        print(f"⚠️ Telegram error: {e}")
-        return None
+    with open(USERS_FILE, "r") as f:
+        return {int(line.strip()) for line in f if line.strip().isdigit()}
 
-def generate_smart_bin():
-    prefixes = ['40', '41', '42', '51', '52', '53', '54', '34', '37']
-    prefix = random.choice(prefixes)
-    while True:
-        remaining = ''.join([str(random.randint(0, 9)) for _ in range(6 - len(prefix))])
-        bin_number = prefix + remaining
-        if luhn_check(bin_number):
-            return bin_number
+def save_user(user_id: int):
+    with open(USERS_FILE, "a") as f:
+        f.write(str(user_id) + "\n")
 
-def luhn_check(bin_number):
-    sum_ = 0
-    for i, digit in enumerate(bin_number):
-        n = int(digit)
-        if i % 2 == 0:
-            n *= 2
-            if n > 9:
-                n -= 9
-        sum_ += n
-    return sum_ % 10 == 0
+approved_users = load_users()
 
-def check_bin(bin_number):
-    global valid_bins, invalid_bins
+def is_approved(user_id: int) -> bool:
+    return user_id in approved_users
+
+# =========================
+# UTILS
+# =========================
+def get_server_status():
+    cpu = psutil.cpu_percent()
+    memory = psutil.virtual_memory().percent
+    disk = psutil.disk_usage("/").percent
+    return f"""
+🤖 Bot Status:
+━━━━━━━━━━━━━━━━
+🖥 CPU: {cpu}%
+📦 RAM: {memory}%
+💽 Disk: {disk}%
+✅ Running smoothly!
+"""
+
+def fetch_bin_info(bin_number: str):
     try:
         url = f"https://data.handyapi.com/bin/{bin_number}"
-        response = requests.get(url, timeout=8)
-        if response.status_code != 200:
-            invalid_bins += 1
-            return None
-        data = response.json()
-        if data.get("Status", "").upper() == "SUCCESS":
-            valid_bins += 1
-            data['bin'] = bin_number  # store BIN for batch formatting
-            return data
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            scheme = data.get("Scheme", "N/A")
+            card_type = data.get("Type", "N/A")
+            brand = data.get("CardTier", "N/A")
+            issuer = data.get("Issuer", "N/A")
+            country = data.get("Country", {}).get("Name", "N/A")
+
+            return f"""
+🏦 VALID BIN FOUND!
+
+💳 BIN: {bin_number}
+💳 Scheme: {scheme}
+📝 Type: {card_type}
+🏷 Brand: {brand}
+🏭 Issuer: {issuer}
+🌐 Country: {country}
+─────────────────────────
+Generated & Verified by BIN Checker Bot
+"""
         else:
-            invalid_bins += 1
-            return None
-    except:
-        invalid_bins += 1
-        return None
+            return f"❌ Failed to fetch BIN {bin_number} (Status {response.status_code})"
+    except Exception as e:
+        return f"⚠️ Error fetching BIN {bin_number}: {e}"
 
-# ---------------- ASYNC WORKERS ----------------
-async def bin_worker(context, duration=None):
-    global running, total_attempts, valid_batch
-    start_time = asyncio.get_event_loop().time()
-    while running:
-        if duration and asyncio.get_event_loop().time() - start_time >= duration:
-            running = False
-            await send_to_telegram(context, "⏹️ Auto-stop reached. Stopping BIN check.")
-            break
-        bin_number = generate_smart_bin()
-        total_attempts += 1
-        data = check_bin(bin_number)
-        if data:
-            valid_batch.append(data)
-            if len(valid_batch) >= BATCH_SIZE:
-                message = ""
-                for v in valid_batch:
-                    message += (
-                        "🏦 VALID BIN FOUND!\n\n"
-                        f"💳 BIN: {v.get('bin','N/A')}\n"
-                        f"💳 Scheme: {v.get('Scheme','N/A').title()}\n"
-                        f"📝 Type: {v.get('Type','N/A').title()}\n"
-                        f"🏷 Brand: {v.get('CardTier','N/A')}\n"
-                        f"🏭 Issuer: {v.get('Issuer','N/A')}\n"
-                        f"🌐 Country: {v.get('Country',{}).get('Name','N/A')}\n"
-                        "─────────────────────────\n"
-                        "Generated & Verified by BIN Checker Bot\n\n"
-                    )
-                await send_to_telegram(context, message)
-                valid_batch = []
-        await asyncio.sleep(CHECK_INTERVAL)
-
-async def stats_worker(context):
-    global running, total_attempts, valid_bins, invalid_bins, stats_message_id
-    if stats_message_id is None:
-        message = (
-            f"📊 <b>Live BIN Checking Stats</b>\n\n"
-            f"⚡ Status: ✅ Running\n"
-            f"🔢 Total Attempts: {total_attempts}\n"
-            f"✅ Valid BINs: {valid_bins}\n"
-            f"❌ Invalid BINs: {invalid_bins}\n"
-            "─────────────────────────\n"
-            "<i>Professional BIN Checker Bot</i>"
-        )
-        stats_message_id = await send_to_telegram(context, message)
-    while running:
-        message = (
-            f"📊 <b>Live BIN Checking Stats</b>\n\n"
-            f"⚡ Status: ✅ Running\n"
-            f"🔢 Total Attempts: {total_attempts}\n"
-            f"✅ Valid BINs: {valid_bins}\n"
-            f"❌ Invalid BINs: {invalid_bins}\n"
-            "─────────────────────────\n"
-            "<i>Professional BIN Checker Bot</i>"
-        )
-        await send_to_telegram(context, message, edit_id=stats_message_id)
-        await asyncio.sleep(STATS_INTERVAL)
-
-# ---------------- TELEGRAM COMMANDS ----------------
+# =========================
+# COMMANDS
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = get_system_status()
-    await update.message.reply_text(
-        f"🤖 Bot is running!\n\nSystem Status:\n{status}\n\nUse /chk <BIN> to check a BIN or /bin to start random checking."
-    )
-
-async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        bin_number = context.args[0]
-        if not bin_number.isdigit() or len(bin_number) != 6:
-            await update.message.reply_text("⚠️ BIN must be exactly 6 digits.")
-            return
-        await update.message.reply_text(f"🔎 Checking BIN: <code>{bin_number}</code>")
-        data = check_bin(bin_number)
-        if data:
-            message = (
-                "🏦 <b>VALID BIN FOUND!</b>\n\n"
-                f"💳 BIN: {bin_number}\n"
-                f"💳 Scheme: {data.get('Scheme','N/A').title()}\n"
-                f"📝 Type: {data.get('Type','N/A').title()}\n"
-                f"🏷 Brand: {data.get('CardTier','N/A')}\n"
-                f"🏭 Issuer: {data.get('Issuer','N/A')}\n"
-                f"🌐 Country: {data.get('Country',{}).get('Name','N/A')}\n"
-                "─────────────────────────\n"
-                "<i>Generated & Verified by BIN Checker Bot</i>"
-            )
-            await send_to_telegram(context, message)
-        else:
-            await update.message.reply_text(f"❌ BIN <code>{bin_number}</code> not found or invalid.")
-    else:
-        await update.message.reply_text("⚠️ Please check the command. Usage: /chk <BIN>")
-
-async def start_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running
-    if running:
-        await update.message.reply_text("⚠️ Random BIN checking is already running.")
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
 
-    running = True
-    duration = None
+    status = get_server_status()
+    await update.message.reply_text(f"👋 Hello {update.effective_user.first_name}!\n{status}")
 
-    # Optional minutes argument for auto-stop
-    if context.args:
-        try:
-            duration = int(context.args[0]) * 60
-            await send_to_telegram(context, f"▶️ <b>Random BIN checking started for {context.args[0]} minutes!</b>")
-        except ValueError:
-            await update.message.reply_text("⚠️ Please provide a valid number of minutes. Example: /bin 10")
-            running = False
+async def bin_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    if len(context.args) == 0:
+        await update.message.reply_text("⚠️ Usage: /bin <bin_number>")
+        return
+
+    bin_number = context.args[0]
+    result = fetch_bin_info(bin_number)
+    await update.message.reply_text(result)
+
+async def batch_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
+
+    if len(context.args) == 0:
+        await update.message.reply_text("⚠️ Usage: /batch <bin1> <bin2> ... <bin10>")
+        return
+
+    bins = context.args[:10]
+    results = []
+    for b in bins:
+        results.append(fetch_bin_info(b))
+        await asyncio.sleep(1)  # avoid spamming API
+
+    await update.message.reply_text("\n".join(results))
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ Only the admin can approve new users.")
+        return
+
+    if len(context.args) == 0:
+        await update.message.reply_text("⚠️ Usage: /add <user_id>")
+        return
+
+    try:
+        new_user = int(context.args[0])
+        if new_user in approved_users:
+            await update.message.reply_text(f"⚠️ User {new_user} is already approved.")
             return
-    else:
-        await send_to_telegram(context, "▶️ <b>Random BIN checking started indefinitely! Use /stop to end.</b>")
+        approved_users.add(new_user)
+        save_user(new_user)
+        await update.message.reply_text(f"✅ User {new_user} has been approved and saved.")
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid user ID.")
 
-    asyncio.create_task(bin_worker(context, duration))
-    asyncio.create_task(stats_worker(context))
+async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_approved(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        return
 
-async def stop_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running, valid_batch
-    if running:
-        running = False
-        if valid_batch:
-            message = ""
-            for v in valid_batch:
-                message += (
-                    "🏦 VALID BIN FOUND!\n\n"
-                    f"💳 BIN: {v.get('bin','N/A')}\n"
-                    f"💳 Scheme: {v.get('Scheme','N/A').title()}\n"
-                    f"📝 Type: {v.get('Type','N/A').title()}\n"
-                    f"🏷 Brand: {v.get('CardTier','N/A')}\n"
-                    f"🏭 Issuer: {v.get('Issuer','N/A')}\n"
-                    f"🌐 Country: {v.get('Country',{}).get('Name','N/A')}\n"
-                    "─────────────────────────\n"
-                    "Generated & Verified by BIN Checker Bot\n\n"
-                )
-            await send_to_telegram(context, message)
-            valid_batch = []
+    await update.message.reply_text("🛑 Bot stopped. Use /start to run again.")
 
-        message = (
-            f"⏹️ <b>Random BIN checking stopped.</b>\n"
-            f"🔢 Total Attempts: {total_attempts}\n"
-            f"✅ Valid BINs: {valid_bins}\n"
-            f"❌ Invalid BINs: {invalid_bins}"
-        )
-        await send_to_telegram(context, message)
-    else:
-        await update.message.reply_text("⚠️ Random BIN checking is not running.")
+# =========================
+# MAIN
+# =========================
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
 
-# ---------------- MAIN ----------------
-if __name__ == '__main__':
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("chk", chk))
-    app.add_handler(CommandHandler("bin", start_bin_cmd))
-    app.add_handler(CommandHandler("stop", stop_bin_cmd))
-    print("🤖 Bot is running...")
+    app.add_handler(CommandHandler("bin", bin_lookup))
+    app.add_handler(CommandHandler("batch", batch_lookup))
+    app.add_handler(CommandHandler("stop", stop_bot))
+    app.add_handler(CommandHandler("add", add_user))
+
+    logger.info("🤖 Bot is running...")
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
