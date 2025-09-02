@@ -11,12 +11,15 @@ BOT_TOKEN = '8329472164:AAHg69_QmSwfelkoYhoaNbdRtmv7vMfxTuQ'
 CHAT_ID = 1822845513
 CHECK_INTERVAL = 1
 STATS_INTERVAL = 10
+BATCH_SIZE = 10
 
+# ---------------- GLOBALS ----------------
 running = False
 total_attempts = 0
 valid_bins = 0
 invalid_bins = 0
 stats_message_id = None
+valid_batch = []
 
 # ---------------- FUNCTIONS ----------------
 def get_system_status():
@@ -89,25 +92,31 @@ def check_bin(bin_number):
         return None
 
 # ---------------- ASYNC WORKERS ----------------
-async def bin_worker(context):
-    global running, total_attempts
+async def bin_worker(context, duration=None):
+    global running, total_attempts, valid_batch
+    start_time = asyncio.get_event_loop().time()
     while running:
+        if duration and asyncio.get_event_loop().time() - start_time >= duration:
+            running = False
+            await send_to_telegram(context, "⏹️ Auto-stop reached. Stopping BIN check.")
+            break
         bin_number = generate_smart_bin()
         total_attempts += 1
         data = check_bin(bin_number)
         if data:
-            message = (
-                "🏦 <b>VALID BIN FOUND!</b>\n\n"
-                f"💳 <b>BIN:</b> <code>{bin_number}</code>\n"
-                f"💳 <b>Scheme:</b> {data.get('Scheme','N/A').title()}\n"
-                f"📝 <b>Type:</b> {data.get('Type','N/A').title()}\n"
-                f"🏷 <b>Brand:</b> {data.get('CardTier','N/A')}\n"
-                f"🏭 <b>Issuer:</b> {data.get('Issuer','N/A')}\n"
-                f"🌐 <b>Country:</b> {data.get('Country',{}).get('Name','N/A')}\n"
-                "─────────────────────────\n"
-                "<i>Generated & Verified by BIN Checker Bot</i>"
+            bin_info = (
+                f"💳 <b>BIN:</b> <code>{bin_number}</code> | "
+                f"{data.get('Scheme','N/A').title()} | "
+                f"{data.get('Type','N/A').title()} | "
+                f"{data.get('CardTier','N/A')} | "
+                f"{data.get('Issuer','N/A')} | "
+                f"{data.get('Country',{}).get('Name','N/A')}"
             )
-            await send_to_telegram(context, message)
+            valid_batch.append(bin_info)
+            if len(valid_batch) >= BATCH_SIZE:
+                message = "✅ <b>Batch of Valid BINs:</b>\n\n" + "\n".join(valid_batch)
+                await send_to_telegram(context, message)
+                valid_batch = []
         await asyncio.sleep(CHECK_INTERVAL)
 
 async def stats_worker(context):
@@ -155,11 +164,11 @@ async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message = (
                 "🏦 <b>VALID BIN FOUND!</b>\n\n"
                 f"💳 <b>BIN:</b> <code>{bin_number}</code>\n"
-                f"💳 <b>Scheme:</b> {data.get('Scheme','N/A').title()}\n"
-                f"📝 <b>Type:</b> {data.get('Type','N/A').title()}\n"
-                f"🏷 <b>Brand:</b> {data.get('CardTier','N/A')}\n"
-                f"🏭 <b>Issuer:</b> {data.get('Issuer','N/A')}\n"
-                f"🌐 <b>Country:</b> {data.get('Country',{}).get('Name','N/A')}\n"
+                f"💳 Scheme: {data.get('Scheme','N/A').title()}\n"
+                f"📝 Type: {data.get('Type','N/A').title()}\n"
+                f"🏷 Brand: {data.get('CardTier','N/A')}\n"
+                f"🏭 Issuer: {data.get('Issuer','N/A')}\n"
+                f"🌐 Country: {data.get('Country',{}).get('Name','N/A')}\n"
                 "─────────────────────────\n"
                 "<i>Generated & Verified by BIN Checker Bot</i>"
             )
@@ -171,18 +180,37 @@ async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running
-    if not running:
-        running = True
-        await send_to_telegram(context, "▶️ <b>Random BIN checking started!</b>")
-        asyncio.create_task(bin_worker(context))
-        asyncio.create_task(stats_worker(context))
-    else:
+    if running:
         await update.message.reply_text("⚠️ Random BIN checking is already running.")
+        return
+
+    running = True
+    duration = None
+
+    # Check for optional minutes argument
+    if context.args:
+        try:
+            duration = int(context.args[0]) * 60  # convert minutes to seconds
+            await send_to_telegram(context, f"▶️ <b>Random BIN checking started for {context.args[0]} minutes!</b>")
+        except ValueError:
+            await update.message.reply_text("⚠️ Please provide a valid number of minutes. Example: /bin 10")
+            running = False
+            return
+    else:
+        await send_to_telegram(context, "▶️ <b>Random BIN checking started indefinitely! Use /stop to end.</b>")
+
+    asyncio.create_task(bin_worker(context, duration))
+    asyncio.create_task(stats_worker(context))
 
 async def stop_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running
+    global running, valid_batch
     if running:
         running = False
+        if valid_batch:
+            message = "✅ <b>Final Batch of Valid BINs:</b>\n\n" + "\n".join(valid_batch)
+            await send_to_telegram(context, message)
+            valid_batch = []
+
         message = (
             f"⏹️ <b>Random BIN checking stopped.</b>\n"
             f"🔢 Total Attempts: {total_attempts}\n"
