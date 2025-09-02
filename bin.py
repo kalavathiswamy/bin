@@ -9,8 +9,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # ---------------- CONFIG ----------------
 BOT_TOKEN = '8329472164:AAHg69_QmSwfelkoYhoaNbdRtmv7vMfxTuQ'
 CHAT_ID = 1822845513
-CHECK_INTERVAL = 1
-STATS_INTERVAL = 10
+CHECK_INTERVAL = 1  # seconds
+STATS_INTERVAL = 10  # seconds
 BATCH_SIZE = 10
 
 # ---------------- GLOBALS ----------------
@@ -83,6 +83,7 @@ def check_bin(bin_number):
         data = response.json()
         if data.get("Status", "").upper() == "SUCCESS":
             valid_bins += 1
+            data['bin'] = bin_number  # store BIN for batch formatting
             return data
         else:
             invalid_bins += 1
@@ -104,17 +105,21 @@ async def bin_worker(context, duration=None):
         total_attempts += 1
         data = check_bin(bin_number)
         if data:
-            bin_info = (
-                f"💳 <b>BIN:</b> <code>{bin_number}</code> | "
-                f"{data.get('Scheme','N/A').title()} | "
-                f"{data.get('Type','N/A').title()} | "
-                f"{data.get('CardTier','N/A')} | "
-                f"{data.get('Issuer','N/A')} | "
-                f"{data.get('Country',{}).get('Name','N/A')}"
-            )
-            valid_batch.append(bin_info)
+            valid_batch.append(data)
             if len(valid_batch) >= BATCH_SIZE:
-                message = "✅ <b>Batch of Valid BINs:</b>\n\n" + "\n".join(valid_batch)
+                message = ""
+                for v in valid_batch:
+                    message += (
+                        "🏦 VALID BIN FOUND!\n\n"
+                        f"💳 BIN: {v.get('bin','N/A')}\n"
+                        f"💳 Scheme: {v.get('Scheme','N/A').title()}\n"
+                        f"📝 Type: {v.get('Type','N/A').title()}\n"
+                        f"🏷 Brand: {v.get('CardTier','N/A')}\n"
+                        f"🏭 Issuer: {v.get('Issuer','N/A')}\n"
+                        f"🌐 Country: {v.get('Country',{}).get('Name','N/A')}\n"
+                        "─────────────────────────\n"
+                        "Generated & Verified by BIN Checker Bot\n\n"
+                    )
                 await send_to_telegram(context, message)
                 valid_batch = []
         await asyncio.sleep(CHECK_INTERVAL)
@@ -163,7 +168,7 @@ async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data:
             message = (
                 "🏦 <b>VALID BIN FOUND!</b>\n\n"
-                f"💳 <b>BIN:</b> <code>{bin_number}</code>\n"
+                f"💳 BIN: {bin_number}\n"
                 f"💳 Scheme: {data.get('Scheme','N/A').title()}\n"
                 f"📝 Type: {data.get('Type','N/A').title()}\n"
                 f"🏷 Brand: {data.get('CardTier','N/A')}\n"
@@ -187,10 +192,10 @@ async def start_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     running = True
     duration = None
 
-    # Check for optional minutes argument
+    # Optional minutes argument for auto-stop
     if context.args:
         try:
-            duration = int(context.args[0]) * 60  # convert minutes to seconds
+            duration = int(context.args[0]) * 60
             await send_to_telegram(context, f"▶️ <b>Random BIN checking started for {context.args[0]} minutes!</b>")
         except ValueError:
             await update.message.reply_text("⚠️ Please provide a valid number of minutes. Example: /bin 10")
@@ -207,7 +212,19 @@ async def stop_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if running:
         running = False
         if valid_batch:
-            message = "✅ <b>Final Batch of Valid BINs:</b>\n\n" + "\n".join(valid_batch)
+            message = ""
+            for v in valid_batch:
+                message += (
+                    "🏦 VALID BIN FOUND!\n\n"
+                    f"💳 BIN: {v.get('bin','N/A')}\n"
+                    f"💳 Scheme: {v.get('Scheme','N/A').title()}\n"
+                    f"📝 Type: {v.get('Type','N/A').title()}\n"
+                    f"🏷 Brand: {v.get('CardTier','N/A')}\n"
+                    f"🏭 Issuer: {v.get('Issuer','N/A')}\n"
+                    f"🌐 Country: {v.get('Country',{}).get('Name','N/A')}\n"
+                    "─────────────────────────\n"
+                    "Generated & Verified by BIN Checker Bot\n\n"
+                )
             await send_to_telegram(context, message)
             valid_batch = []
 
