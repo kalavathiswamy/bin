@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-import os
 import psutil
 import requests
 import random
 import threading
 import time
-from telegram import Bot, Update
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------------- CONFIG ----------------
@@ -15,7 +14,6 @@ CHECK_INTERVAL = 1
 STATS_INTERVAL = 10
 TELEGRAM_DELAY = 1.5
 
-bot = Bot(BOT_TOKEN)
 running = False
 total_attempts = 0
 valid_bins = 0
@@ -32,21 +30,21 @@ def get_system_status():
     storage = f"Total: {disk.total // (2**30)} GB, Used: {disk.used // (2**30)} GB, Free: {disk.free // (2**30)} GB"
     return f"CPU: {cpu}%\nMemory: {mem_percent}%\nDisk: {disk_percent}%\nStorage: {storage}"
 
-def send_to_telegram(message: str, edit_id=None):
+def send_to_telegram(context, message: str, edit_id=None):
     global stats_message_id
     try:
         if edit_id and stats_message_id:
-            bot.edit_message_text(chat_id=CHAT_ID, message_id=edit_id,
-                                  text=message, parse_mode='HTML', disable_web_page_preview=True)
+            context.bot.edit_message_text(chat_id=CHAT_ID, message_id=edit_id,
+                                          text=message, parse_mode='HTML', disable_web_page_preview=True)
         else:
-            msg = bot.send_message(CHAT_ID, text=message, parse_mode='HTML', disable_web_page_preview=True)
+            msg = context.bot.send_message(CHAT_ID, text=message, parse_mode='HTML', disable_web_page_preview=True)
             time.sleep(TELEGRAM_DELAY)
             return msg.message_id
     except Exception as e:
         print(f"⚠️ Telegram send/edit error: {e}")
         return None
 
-def check_bin(bin_number: str) -> bool:
+def check_bin(bin_number: str, context=None) -> bool:
     global valid_bins, invalid_bins
     try:
         url = f"https://data.handyapi.com/bin/{bin_number}"
@@ -69,7 +67,8 @@ def check_bin(bin_number: str) -> bool:
                 "─────────────────────────\n"
                 "<i>Generated & Verified by BIN Checker Bot</i>"
             )
-            send_to_telegram(message)
+            if context:
+                send_to_telegram(context, message)
             valid_bins += 1
             return True
         else:
@@ -84,8 +83,6 @@ def check_bin(bin_number: str) -> bool:
 def generate_smart_bin():
     prefixes = ['40', '41', '42', '51', '52', '53', '54', '34', '37']  # common BIN prefixes
     prefix = random.choice(prefixes)
-    
-    # Fill remaining digits randomly and try Luhn
     while True:
         remaining = ''.join([str(random.randint(0, 9)) for _ in range(6 - len(prefix))])
         bin_number = prefix + remaining
@@ -104,15 +101,15 @@ def luhn_check(bin_number):
     return sum_ % 10 == 0
 
 # ---------------- WORKERS ----------------
-def bin_worker():
+def bin_worker(context):
     global running, total_attempts
     while running:
         bin_number = generate_smart_bin()
         total_attempts += 1
-        check_bin(bin_number)
+        check_bin(bin_number, context)
         time.sleep(CHECK_INTERVAL)
 
-def stats_worker():
+def stats_worker(context):
     global running, total_attempts, valid_bins, invalid_bins, stats_message_id
     if stats_message_id is None:
         stats_message = (
@@ -124,7 +121,7 @@ def stats_worker():
             "─────────────────────────\n"
             "<i>Professional BIN Checker Bot</i>"
         )
-        stats_message_id = send_to_telegram(stats_message)
+        stats_message_id = send_to_telegram(context, stats_message)
     while running:
         if stats_message_id:
             stats_message = (
@@ -136,13 +133,15 @@ def stats_worker():
                 "─────────────────────────\n"
                 "<i>Professional BIN Checker Bot</i>"
             )
-            send_to_telegram(stats_message, edit_id=stats_message_id)
+            send_to_telegram(context, stats_message, edit_id=stats_message_id)
         time.sleep(STATS_INTERVAL)
 
 # ---------------- TELEGRAM COMMANDS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = get_system_status()
-    await update.message.reply_text(f"🤖 Bot is running!\n\nSystem Status:\n{status}\n\nUse /chk <BIN> to check a BIN or /bin to start random checking.")
+    await update.message.reply_text(
+        f"🤖 Bot is running!\n\nSystem Status:\n{status}\n\nUse /chk <BIN> to check a BIN or /bin to start random checking."
+    )
 
 async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
@@ -151,7 +150,7 @@ async def chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ BIN must be exactly 6 digits.")
             return
         await update.message.reply_text(f"🔎 Checking BIN: <code>{bin_number}</code>")
-        result = check_bin(bin_number)
+        result = check_bin(bin_number, context)
         if not result:
             await update.message.reply_text(f"❌ BIN <code>{bin_number}</code> not found or invalid.")
     else:
@@ -161,9 +160,9 @@ async def start_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running
     if not running:
         running = True
-        send_to_telegram("▶️ <b>Random BIN checking started!</b>")
-        threading.Thread(target=bin_worker).start()
-        threading.Thread(target=stats_worker).start()
+        send_to_telegram(context, "▶️ <b>Random BIN checking started!</b>")
+        threading.Thread(target=bin_worker, args=(context,), daemon=True).start()
+        threading.Thread(target=stats_worker, args=(context,), daemon=True).start()
     else:
         await update.message.reply_text("⚠️ Random BIN checking is already running.")
 
@@ -177,7 +176,7 @@ async def stop_bin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Valid BINs: {valid_bins}\n"
             f"❌ Invalid BINs: {invalid_bins}"
         )
-        send_to_telegram(final_stats)
+        send_to_telegram(context, final_stats)
     else:
         await update.message.reply_text("⚠️ Random BIN checking is not running.")
 
